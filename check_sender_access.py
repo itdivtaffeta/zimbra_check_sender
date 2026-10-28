@@ -13,9 +13,16 @@ Changes from the original:
   * Python 3 (configparser, bytes -> str decoding of LDAP values)
   * LDAP filter values are escaped (original was open to LDAP injection)
   * LDAP connection is reused per SMTP connection and closed on close()
-  * LDAP errors fail open with a log line instead of raising
+  * LDAP errors fail open with a log line instead of raising: an LDAP
+    outage or a login without an LDAP entry never blocks mail; only a
+    proven violation rejects
   * referral entries from LDAP are ignored
   * log queue no longer blocks the milter when full
+  * From: headers with zero or multiple mailboxes are rejected
+    (email.utils.parseaddr silently returned the first one, hiding a
+    second, unchecked identity)
+  * exclude_re only skips the envelope-sender-vs-login lookup; it no
+    longer disables the From: ownership check for the message
   * optional `only_authenticated` setting in [main] (default: false)
   * optional `enforce_login` setting in [main] (default: false): for SASL
     authenticated sessions, BOTH the envelope sender (MAIL FROM) and the From:
@@ -33,7 +40,7 @@ import uuid
 import logging
 import queue as queue_mod
 from configparser import ConfigParser
-from email.utils import parseaddr
+from email.message import EmailMessage
 from logging.handlers import SysLogHandler
 from multiprocessing import Process, Queue
 
@@ -90,6 +97,40 @@ escape = ldap.filter.escape_filter_chars
 logq = Queue(maxsize=1000)
 
 
+def parse_mailbox(raw, allow_null=False):
+    """
+    Parse exactly one mailbox from an envelope sender or a From: header
+    value. Returns (addr, None) with addr lowercased ('' for the null
+    sender '<>', only when allow_null), or (None, reason) with reason one
+    of 'empty', 'malformed', 'multiple'. A header value holding more than
+    one mailbox must never be trusted: checking only the first one lets a
+    second, unchecked identity through.
+    """
+    # unfold continuation lines; EmailMessage rejects raw CR/LF
+    text = re.sub(r'\r?\n[ \t]*', ' ', (raw or '').strip()).strip()
+    if not text:
+        return ('', None) if allow_null else (None, 'empty')
+    if allow_null and text == '<>':
+        return '', None
+    msg = EmailMessage()
+    try:
+        msg['from'] = text
+        hdr = msg['from']
+        addrs = hdr.addresses
+        defects = list(hdr.defects)
+    except Exception:
+        return None, 'malformed'
+    if defects:
+        return None, 'malformed'
+    if len(addrs) != 1:
+        return None, 'multiple' if addrs else 'malformed'
+    addr = addrs[0].addr_spec.strip().lower()
+    local, _, domain = addr.partition('@')
+    if not local or not domain:
+        return None, 'malformed'
+    return addr, None
+
+
 # --------------------------------------------------------------------------
 # Milter
 # --------------------------------------------------------------------------
@@ -100,6 +141,7 @@ class CheckSenderAccess(Milter.Base):
         self.start_time = time.time()
         self.check_id = uuid.uuid1().hex[:8]
         self.orig_from = None
+        self.envelope_excluded = False
         self.authenticated = False
         self.auth_user = None
         self.ldp = None
@@ -190,7 +232,10 @@ class CheckSenderAccess(Milter.Base):
     def is_allowed(self, identity, addr):
         """
         True if `identity` (SASL login or envelope sender) may use `addr`,
-        False if not, None when LDAP is unavailable (caller fails open).
+        False if not, None when it cannot be decided (LDAP down, or a SASL
+        login with no LDAP entry). The caller decides whether None fails
+        open (unauthenticated inbound mail) or closed (authenticated
+        sessions with enforce_login).
         """
         if self.ldp is None and not self._init_ldap():
             return None
@@ -230,47 +275,63 @@ class CheckSenderAccess(Milter.Base):
 
     # -- milter callbacks --------------------------------------------------
     def envfrom(self, mailfrom, *args):
-        _, addr = parseaddr(mailfrom.lower())
         self.auth_user = (self.getsymval('{auth_authen}') or '').strip().lower() or None
         self.authenticated = bool(self.auth_user)
-        if EXCEPTION_RE and EXCEPTION_RE.search(addr):
+        addr, err = parse_mailbox(mailfrom, allow_null=True)
+        self.envelope_excluded = False
+        if addr and EXCEPTION_RE and EXCEPTION_RE.search(addr):
             self.logd('{0} matches EXCEPTION regex, ignoring'.format(addr))
-            addr = None
+            self.envelope_excluded = True
         self.orig_from = addr
 
         # authenticated session: the envelope sender must belong to the login too
-        if ENFORCE_LOGIN and self.auth_user and addr:
+        if ENFORCE_LOGIN and self.auth_user:
+            if err:
+                self.log('unparsable envelope sender {0!r} ({1}) in authenticated '
+                         'session, rejecting'.format(mailfrom, err))
+                self.setreply('550', '5.7.1', WARN_MSG)
+                return self._done(Milter.REJECT)
+            if not addr or self.envelope_excluded:
+                # null sender and excluded envelopes are verified when the
+                # From: header arrives
+                return Milter.CONTINUE
             parts = addr.split('@')
             if len(parts) == 2 and parts[1] in DOMAINS:
                 self.logd('login {0} uses envelope sender {1}'.format(self.auth_user, addr))
                 if self.is_allowed(self.auth_user, addr) is False:
+                    # None (LDAP down, login not in LDAP) fails open; only
+                    # a proven violation rejects
                     self.setreply('550', '5.7.1', WARN_MSG)
                     return self._done(Milter.REJECT)
         return Milter.CONTINUE
 
     def header(self, name, val):
-        if name.strip().lower() != 'from' or not self.orig_from:
+        if name.strip().lower() != 'from':
             return Milter.CONTINUE
 
         if ONLY_AUTHENTICATED and not self.authenticated:
             self.logd('Session is not authenticated, skipping check')
             return Milter.CONTINUE
 
-        _, from_addr = parseaddr(val.lower())
+        from_addr, err = parse_mailbox(val)
+        if err:
+            if not (ENFORCE_LOGIN and self.authenticated):
+                # unauthenticated inbound mail: keep the historical
+                # fail-open behaviour for odd headers
+                return Milter.CONTINUE
+            self.log('unparsable From: header {0!r} ({1}) in authenticated '
+                     'session, rejecting'.format(val, err))
+            self.setreply('550', '5.7.1', WARN_MSG)
+            return self._done(Milter.REJECT)
 
-        # if no email then ignore it
-        if not from_addr:
-            return Milter.CONTINUE
-        # if same as MAIL FROM then ignore it (with enforce_login the envelope
-        # sender was already validated against the login in envfrom)
-        if self.orig_from == from_addr:
+        # if same as MAIL FROM then ignore it, unless the envelope sender was
+        # excluded by exclude_re and never checked against the login
+        if self.orig_from == from_addr and not self.envelope_excluded:
             return Milter.CONTINUE
 
         # check if the From: domain is in the checked domain list
         parts = from_addr.split('@')
-        if len(parts) != 2:
-            return Milter.CONTINUE
-        if parts[1] not in DOMAINS:
+        if len(parts) != 2 or parts[1] not in DOMAINS:
             return Milter.CONTINUE
 
         self.logd('{0} is in domain list ({1})'.format(from_addr, DOMAINS))
@@ -279,10 +340,18 @@ class CheckSenderAccess(Milter.Base):
             self.logd('{0} matches EXCEPTION envelope FROM regex, continue'.format(from_addr))
             return self._done(Milter.CONTINUE)
 
+        # authenticated sessions with enforce_login check against the SASL
+        # login; otherwise against the envelope sender. A message without a
+        # usable envelope identity (null sender or excluded envelope) can
+        # only be checked against the login.
         identity = self.auth_user if (ENFORCE_LOGIN and self.auth_user) else self.orig_from
+        if not identity:
+            return Milter.CONTINUE
         allowed = self.is_allowed(identity, from_addr)
 
-        if allowed is None:  # LDAP trouble: fail open
+        if allowed is None:  # undecidable: LDAP trouble or unknown login
+            # fail open: mail must not be blocked by an LDAP outage or a
+            # login without an LDAP entry; the reason is logged instead
             return self._done(Milter.CONTINUE)
         if not allowed:
             self.setreply('550', '5.7.1', WARN_MSG)
