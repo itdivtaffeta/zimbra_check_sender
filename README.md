@@ -1,43 +1,56 @@
 # zimbra_check_sender
 
-Postfix milter for Zimbra/Carbonio that stops authenticated users from sending mail as somebody else.
+Postfix milter for Zimbra/Carbonio that stops authenticated users from sending
+mail as somebody else.
 
 It checks two things against LDAP:
 
-- the envelope sender (`MAIL FROM`) of authenticated sessions must belong to the SASL login (`enforce_login`);
-- the `From:` header must belong to the envelope sender, or to the SASL login when `enforce_login` is on.
+- the envelope sender (`MAIL FROM`) of authenticated sessions must belong to the
+  SASL login (`enforce_login`);
+- the `From:` header must belong to the envelope sender, or to the SASL login
+  when `enforce_login` is on.
 
-Only addresses in `domains` are checked. Aliases, catch-all and canonical addresses are accepted through the LDAP attributes listed in `search_attrs`; `check_sendas_dist` additionally allows `sendAsDistList` on distribution lists. Anything unexpected (LDAP down, bad bind, login not found) is logged and the mail is let through, so the milter never silently loses mail by itself.
+Only addresses in `domains` are checked. Aliases, catch-all and canonical
+addresses are accepted through the LDAP attributes listed in `search_attrs`;
+`check_sendas_dist` additionally allows `sendAsDistList` on distribution lists.
+Anything undecidable (LDAP down, bad bind, login not found in LDAP) is logged
+and the mail is let through, for authenticated and unauthenticated sessions
+alike: an LDAP outage never blocks mail. Only a proven violation is rejected.
 
-Original description: <https://iomarmochtar.wordpress.com/2017/09/13/zimbra-prevent-user-customizing-from-header/>
+Original description:
+<https://iomarmochtar.wordpress.com/2017/09/13/zimbra-prevent-user-customizing-from-header/>
 
 ## Configuration
 
-`etc/config.ini` is not tracked by git; copy it from `etc/config_dist.ini`. The path can be overridden with `ZMBR_CONFIG`.
+`etc/config.ini` is not tracked by git; copy it from `etc/config_dist.ini`. The
+path can be overridden with `ZMBR_CONFIG`.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `name` | `postfix/mail_from_check` | Logger name; this is what you grep in the mail log. |
-| `listen_port` | `5000@127.0.0.1` | Milter socket, as `port@address`. Use `127.0.0.1`, never `0.0.0.0`. |
-| `debug` | `false` | Verbose per-step logging. Turn off after deployment. |
-| `domains` | – | `;`-separated, no spaces. Only `From:`/sender domains listed here are checked. |
-| `exclude_re` | empty | Regex whitelist on the envelope sender. |
-| `exclude_enve_re` | empty | Regex whitelist on the `From:` address. |
-| `warn_msg` | `Client does not have permissions to send as this sender` | Text of the `550 5.7.1` reply. |
-| `check_sendas_dist` | `false` | Also allow senders with `sendAsDistList` on a distribution list. Needs LDAP read rights for `zimbra_ldap_userdn`. |
-| `only_authenticated` | `false` | Check only SASL-authenticated sessions (ignore inbound port 25). |
-| `enforce_login` | `false` | Check the envelope sender against the SASL login as well as the `From:` header. |
-| `ldap.url` | – | `ldap://host:389`. Use the host IP if LDAP does not listen on localhost. |
-| `ldap.bind` | – | `uid=zimbra,cn=admins,cn=zimbra`. |
-| `ldap.pwd` | – | Value of `zimbra_ldap_password`. |
-| `ldap.base_search` | empty | Base DN of the domain tree, e.g. `ou=people,dc=example,dc=com`. One base per instance; multiple domains need a common parent. |
-| `ldap.search_attrs` | `mail;zimbraMailCatchAllAddress;zimbraMailCanonicalAddress` | `;`-separated attributes that may hold an allowed address. |
+| Option               | Default                                                     | Meaning                                                                                                                                                           |
+| -------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`               | `postfix/mail_from_check`                                   | Logger name; this is what you grep in the mail log.                                                                                                               |
+| `listen_port`        | `5000@127.0.0.1`                                            | Milter socket, as `port@address`. Use `127.0.0.1`, never `0.0.0.0`.                                                                                               |
+| `debug`              | `false`                                                     | Verbose per-step logging. Turn off after deployment.                                                                                                              |
+| `domains`            | –                                                           | `;`-separated, no spaces. Only `From:`/sender domains listed here are checked.                                                                                    |
+| `exclude_re`         | empty                                                       | Regex whitelist on the envelope sender: skips the envelope-vs-login check. The `From:` header is still checked against the SASL login for authenticated sessions. |
+| `exclude_enve_re`    | empty                                                       | Regex whitelist on the `From:` address.                                                                                                                           |
+| `warn_msg`           | `Client does not have permissions to send as this sender`   | Text of the `550 5.7.1` reply.                                                                                                                                    |
+| `check_sendas_dist`  | `false`                                                     | Also allow senders with `sendAsDistList` on a distribution list. Needs LDAP read rights for `zimbra_ldap_userdn`.                                                 |
+| `only_authenticated` | `false`                                                     | Check only SASL-authenticated sessions (ignore inbound port 25).                                                                                                  |
+| `enforce_login`      | `false`                                                     | Check the envelope sender against the SASL login as well as the `From:` header.                                                                                   |
+| `ldap.url`           | –                                                           | `ldap://host:389`. Use the host IP if LDAP does not listen on localhost.                                                                                          |
+| `ldap.bind`          | –                                                           | `uid=zimbra,cn=admins,cn=zimbra`.                                                                                                                                 |
+| `ldap.pwd`           | –                                                           | Value of `zimbra_ldap_password`.                                                                                                                                  |
+| `ldap.base_search`   | empty                                                       | Base DN of the domain tree, e.g. `ou=people,dc=example,dc=com`. One base per instance; multiple domains need a common parent.                                     |
+| `ldap.search_attrs`  | `mail;zimbraMailCatchAllAddress;zimbraMailCanonicalAddress` | `;`-separated attributes that may hold an allowed address.                                                                                                        |
 
-The milter logs to syslog facility `mail`, which is `/var/log/zimbra.log` on Zimbra and journald on Carbonio.
+The milter logs to syslog facility `mail`, which is `/var/log/zimbra.log` on
+Zimbra and journald on Carbonio.
 
 ## Deployment runbook (Carbonio)
 
-RnD-only steps are marked. Replace `<domain>` with your domain (`megasyariah.co.id` for production, `taffeta.dev` for RnD). Commands run as root unless stated `zextras`.
+RnD-only steps are marked. Replace `<domain>` with your domain (`taffeta.co.id`
+for production, `taffeta.dev` for RnD). Commands run as root unless stated
+`zextras`.
 
 ### 0. Pre-deploy checks
 
@@ -49,10 +62,13 @@ postconf smtpd_milters milter_default_action milter_mail_macros smtpd_sender_res
 /opt/zextras/common/sbin/postqueue -p | tail -1
 ```
 
-- `zimbraMtaSmtpdMilters` is usually empty. If it is not, save the value for rollback.
+- `zimbraMtaSmtpdMilters` is usually empty. If it is not, save the value for
+  rollback.
 - `smtpd_milters` should show only `inet:127.0.0.1:7026`.
-- `milter_default_action = tempfail` means mail is deferred, not lost, if the milter is down. The milter must be running before you hook it in.
-- `milter_mail_macros` must include `{auth_authen}`. Without it `only_authenticated` and `enforce_login` cannot work.
+- `milter_default_action = tempfail` means mail is deferred, not lost, if the
+  milter is down. The milter must be running before you hook it in.
+- `milter_mail_macros` must include `{auth_authen}`. Without it
+  `only_authenticated` and `enforce_login` cannot work.
 - Note the queue size for comparison afterwards.
 
 Check services and ports as root:
@@ -64,8 +80,10 @@ ss -ltnp | grep 5000
 python3 --version
 ```
 
-- `carbonio-configd` and the MTA target must be active. Unit names on older Carbonio may differ.
-- Nothing should hold port 5000. If something does, pick another port and use it everywhere below.
+- `carbonio-configd` and the MTA target must be active. Unit names on older
+  Carbonio may differ.
+- Nothing should hold port 5000. If something does, pick another port and use it
+  everywhere below.
 - Python 3 must be present and reasonably current.
 
 Check LDAP reachability as `zextras`:
@@ -77,7 +95,8 @@ Check LDAP reachability as `zextras`:
   -b "ou=people,<base DN of your domain>" "(mail=realuser@<domain>)" mail zimbraId
 ```
 
-The search must return exactly one entry. For `megasyariah.co.id` the base DN is `ou=people,dc=megasyariah,dc=co,dc=id`.
+The search must return exactly one entry. For `taffeta.co.id` the base DN is
+`ou=people,dc=taffeta,dc=co,dc=id`.
 
 Back up the generated Postfix config for reference:
 
@@ -86,7 +105,8 @@ mkdir -p /root/pre-milter
 cp -a /opt/zextras/common/conf/main.cf /opt/zextras/common/conf/master.cf /root/pre-milter/
 ```
 
-If a second MTA server exists, run the whole runbook on each. Finish and verify the first one before starting the second.
+If a second MTA server exists, run the whole runbook on each. Finish and verify
+the first one before starting the second.
 
 ### 1. Install
 
@@ -143,7 +163,8 @@ Get the password as `zextras`:
 /opt/zextras/bin/zmlocalconfig -s zimbra_ldap_password
 ```
 
-Separate multiple domains with `;` and no spaces. A single `base_search` covers one domain tree. Then lock down the files:
+Separate multiple domains with `;` and no spaces. A single `base_search` covers
+one domain tree. Then lock down the files:
 
 ```sh
 chown -R zmbrmilter: /opt/zmbr_check_sender
@@ -156,7 +177,9 @@ chmod 600 /opt/zmbr_check_sender/etc/config.ini
 sudo -u zmbrmilter /opt/zmbr_check_sender/venv/bin/python /opt/zmbr_check_sender/check_sender_access.py
 ```
 
-You should see `milter running on 5000@127.0.0.1`. In another terminal, `ss -ltnp | grep 5000` must show `127.0.0.1:5000`, not `0.0.0.0:5000`. Stop it with Ctrl+C.
+You should see `milter running on 5000@127.0.0.1`. In another terminal,
+`ss -ltnp | grep 5000` must show `127.0.0.1:5000`, not `0.0.0.0:5000`. Stop it
+with Ctrl+C.
 
 ### 4. Run it as a service
 
@@ -188,7 +211,8 @@ systemctl status zmbr-check-sender --no-pager
 ss -ltnp | grep 5000
 ```
 
-The service must be `active (running)` and listening on `127.0.0.1:5000` before the next step.
+The service must be `active (running)` and listening on `127.0.0.1:5000` before
+the next step.
 
 ### 5. Hook it into Postfix
 
@@ -204,17 +228,25 @@ Restart the MTA as root:
 systemctl restart carbonio-mta.target
 ```
 
-Then check as `zextras` (the config daemon may need a moment to rewrite the config):
+Then check as `zextras` (the config daemon may need a moment to rewrite the
+config):
 
 ```sh
 postconf smtpd_milters
 ```
 
-Expected: `inet:127.0.0.1:5000, inet:127.0.0.1:7026`. Carbonio adds 7026 itself; do not include it in the attribute. If only 7026 appears after a minute, restart `carbonio-configd` as root and check again. If it still does not change, roll back (section 9) and collect the output.
+Expected: `inet:127.0.0.1:5000, inet:127.0.0.1:7026`. Carbonio adds 7026 itself;
+do not include it in the attribute. If only 7026 appears after a minute, restart
+`carbonio-configd` as root and check again. If it still does not change, roll
+back (section 9) and collect the output.
 
 ### 6. RnD server only
 
-**Do not run this on production.** The lab version of Carbonio enforces `reject_sender_login_mismatch`, which was disabled to make the RnD box behave like production. The setting returns on every MTA restart or config regeneration, so reapply it after the restart in step 5 and after any later restart.
+**Do not run this on production.** The lab version of Carbonio enforces
+`reject_sender_login_mismatch`, which was disabled to make the RnD box behave
+like production. The setting returns on every MTA restart or config
+regeneration, so reapply it after the restart in step 5 and after any later
+restart.
 
 As `zextras`:
 
@@ -236,15 +268,16 @@ postconf smtpd_sender_restrictions
 
 ### 7. Test
 
-Run these from another machine (`apt install swaks`) using real mailbox logins. `A` and `B` are two real users in your domain.
+Run these from another machine (`apt install swaks`) using real mailbox logins.
+`A` and `B` are two real users in your domain.
 
-| Test | Command options | Expected |
-|---|---|---|
-| Normal mail | `--auth-user A --from A --h-From A` | accepted |
-| Own alias | `--auth-user A --from A --h-From <A's alias>` | accepted |
-| Spoof `From:` header | `--auth-user A --from A --h-From B` | `550 5.7.1 Client does not have permissions to send as this sender` after the body |
-| Spoof both | `--auth-user A --from B --h-From B` | `550 5.7.1 ...` at `MAIL FROM` |
-| Unauthenticated | port 25, no login, any sender | not rejected by this milter |
+| Test                 | Command options                               | Expected                                                                           |
+| -------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Normal mail          | `--auth-user A --from A --h-From A`           | accepted                                                                           |
+| Own alias            | `--auth-user A --from A --h-From <A's alias>` | accepted                                                                           |
+| Spoof `From:` header | `--auth-user A --from A --h-From B`           | `550 5.7.1 Client does not have permissions to send as this sender` after the body |
+| Spoof both           | `--auth-user A --from B --h-From B`           | `550 5.7.1 ...` at `MAIL FROM`                                                     |
+| Unauthenticated      | port 25, no login, any sender                 | not rejected by this milter                                                        |
 
 Base command:
 
@@ -260,11 +293,14 @@ Check the log for each case:
 journalctl --since "10 min ago" | grep mail_from_check
 ```
 
-Look for `Violation found` on the rejected cases and for no `LDAP error` or `Invalid LDAP credential`. Also send from a real mail client (Thunderbird or Outlook) and receive one mail from outside.
+Look for `Violation found` on the rejected cases and for no `LDAP error` or
+`Invalid LDAP credential`. Also send from a real mail client (Thunderbird or
+Outlook) and receive one mail from outside.
 
 ### 8. After deployment
 
-- Set `debug = false` in `config.ini`, then `systemctl restart zmbr-check-sender`.
+- Set `debug = false` in `config.ini`, then
+  `systemctl restart zmbr-check-sender`.
 - Watch for problems during the first days:
 
   ```sh
@@ -272,14 +308,25 @@ Look for `Violation found` on the rejected cases and for no `LDAP error` or `Inv
   /opt/zextras/common/sbin/postqueue -p | tail -1
   ```
 
-  Compare the queue size with the baseline and look for deferred mail mentioning the milter.
-- Review every `Violation found` line. If a legitimate sender is blocked (shared mailbox, mailing list, scanner, web app), whitelist it with `exclude_re` (envelope sender) or `exclude_enve_re` (`From:` address), then restart the service.
-- `login ... not found in ldap` warnings mean the login does not map to an LDAP entry. The mail is let through; find out why.
-- After any Carbonio upgrade, confirm `postconf smtpd_milters` still contains port 5000.
+  Compare the queue size with the baseline and look for deferred mail mentioning
+  the milter.
+
+- Review every `Violation found` line. If a legitimate sender is blocked (shared
+  mailbox, mailing list, scanner, web app), whitelist it with `exclude_re`
+  (envelope sender) or `exclude_enve_re` (`From:` address), then restart the
+  service. `exclude_re` only relaxes the envelope-vs-login check; authenticated
+  sessions are still checked against the SASL login, so it cannot be used to let
+  a user send as somebody else.
+- `login ... not found in ldap` warnings mean the login does not map to an LDAP
+  entry. The mail is let through (fail open), but that login is unchecked until
+  you fix the mapping (`search_attrs`, `base_search`); find out why.
+- After any Carbonio upgrade, confirm `postconf smtpd_milters` still contains
+  port 5000.
 
 ### 9. Rollback
 
-**Milter down and mail deferred** (4xx on submission, growing queue): bring the milter back first.
+**Milter down and mail deferred** (4xx on submission, growing queue): bring the
+milter back first.
 
 ```sh
 systemctl start zmbr-check-sender
@@ -290,7 +337,8 @@ Deferred mail is not lost; sending servers retry.
 
 **Full rollback:**
 
-1. As `zextras`, remove the milter from Postfix. If step 0 recorded a non-empty previous value, restore that instead of an empty string:
+1. As `zextras`, remove the milter from Postfix. If step 0 recorded a non-empty
+   previous value, restore that instead of an empty string:
 
    ```sh
    carbonio prov ms $(zmhostname) zimbraMtaSmtpdMilters ''
@@ -302,13 +350,17 @@ Deferred mail is not lost; sending servers retry.
    systemctl restart carbonio-configd
    ```
 
-   Check as `zextras` that `postconf smtpd_milters` is back to `inet:127.0.0.1:7026`. If not, also run `systemctl restart carbonio-mta.target`.
+   Check as `zextras` that `postconf smtpd_milters` is back to
+   `inet:127.0.0.1:7026`. If not, also run
+   `systemctl restart carbonio-mta.target`.
 
 3. Stop the service: `systemctl disable --now zmbr-check-sender`.
 4. Flush deferred mail: `/opt/zextras/common/sbin/postqueue -f`.
 5. Send a test mail and confirm normal delivery.
 
-**RnD only:** the `postconf -e` change reverts itself on the next MTA restart or config regeneration. To undo it immediately, restart `carbonio-configd` and recheck `postconf smtpd_sender_restrictions`.
+**RnD only:** the `postconf -e` change reverts itself on the next MTA restart or
+config regeneration. To undo it immediately, restart `carbonio-configd` and
+recheck `postconf smtpd_sender_restrictions`.
 
 To remove everything:
 
@@ -321,7 +373,20 @@ userdel zmbrmilter
 
 ## Notes
 
-- **Production is an older Carbonio.** Unit names, the config rule that builds `smtpd_milters`, and package availability may differ from the RnD box. The check that matters is step 5: `postconf smtpd_milters` must show port 5000. Test in a maintenance window with the rollback commands ready.
-- **Fail-open behavior:** if LDAP is unreachable or the bind fails, the milter logs it and lets mail through, so a wrong LDAP password does not show up as rejected mail. Check the logs after setting `pwd`.
-- **Scope:** only envelope senders and `From:` headers in your `domains` are checked. A logged-in user can still use an external address as the envelope sender.
-- **Password in `config.ini`:** keep it `chmod 600` and never paste it into tickets or chats.
+- **Production is an older Carbonio.** Unit names, the config rule that builds
+  `smtpd_milters`, and package availability may differ from the RnD box. The
+  check that matters is step 5: `postconf smtpd_milters` must show port 5000.
+  Test in a maintenance window with the rollback commands ready.
+- **LDAP outage behavior (fail open):** if LDAP is unreachable or the bind
+  fails, **all** mail is let through, authenticated or not — the milter never
+  blocks mail on its own infrastructure problems. The reason is logged (`Cannot
+  contact ldap server`, `Invalid LDAP credential`, `LDAP error while checking`),
+  and every spoof attempt that would have been caught passes silently during
+  the outage. Monitor those log lines; a long LDAP outage means the spoofing
+  protection is effectively off. Verify `pwd` with the step-0 ldapsearch before
+  deployment and check the logs afterwards.
+- **Scope:** only envelope senders and `From:` headers in your `domains` are
+  checked. A logged-in user can still use an external address as the envelope
+  sender.
+- **Password in `config.ini`:** keep it `chmod 600` and never paste it into
+  tickets or chats.
