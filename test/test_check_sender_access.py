@@ -33,6 +33,23 @@ DIRECTORY = {
     })],
 }
 
+# Delegated send-as targets, keyed by (object class, right) as they appear in
+# ACL search filters. info@ is a shared account; support@ has no grant for
+# alice; lists@ is a distribution list with the DL right.
+ACL_DIRECTORY = {
+    ('zimbraAccount', 'ID-ALICE usr sendAs', 'mail=info@example.test'): [
+        ('uid=info,ou=people,dc=example,dc=test', {
+            'mail': [b'info@example.test'],
+            'zimbraACE': [b'ID-ALICE usr sendAs'],
+        })],
+    ('zimbraDistributionList', 'ID-ALICE usr sendAsDistList',
+     'mail=lists@example.test'): [
+        ('cn=lists,ou=groups,dc=example,dc=test', {
+            'mail': [b'lists@example.test'],
+            'zimbraACE': [b'ID-ALICE usr sendAsDistList'],
+        })],
+}
+
 CONFIG_TEMPLATE = """\
 [main]
 name = postfix/mail_from_check
@@ -42,7 +59,7 @@ domains = example.test
 exclude_re = {exclude_re}
 exclude_enve_re = {exclude_enve_re}
 warn_msg = {warn_msg}
-check_sendas_dist = false
+check_sendas_dist = {check_sendas_dist}
 only_authenticated = {only_authenticated}
 enforce_login = {enforce_login}
 
@@ -85,6 +102,16 @@ def make_ldap_module(directory, fail=None):
         def search_s(self, base, scope, sfilter, attrs):
             if fail == 'search':
                 raise LDAPError('search failed')
+            # ACL search: match on the complete filter (object class, right,
+            # and target address) so a query for the wrong right or object
+            # class never passes accidentally.
+            for (objclass, ace, mail), entry in ACL_DIRECTORY.items():
+                if ('objectClass={0}'.format(objclass) in sfilter
+                        and ace in sfilter and mail in sfilter):
+                    return entry
+            if 'objectClass=zimbraDistributionList' in sfilter or \
+                    'objectClass=zimbraAccount' in sfilter:
+                return []
             for key, entry in directory.items():
                 if key in sfilter:
                     return entry
@@ -139,10 +166,12 @@ _load_counter = [0]
 
 
 def load_milter(only_authenticated='true', enforce_login='true',
-                exclude_re='', exclude_enve_re='', fail=None):
+                exclude_re='', exclude_enve_re='', check_sendas_dist='false',
+                fail=None):
     config_text = CONFIG_TEMPLATE.format(
         exclude_re=exclude_re, exclude_enve_re=exclude_enve_re,
-        warn_msg=WARN_MSG, only_authenticated=only_authenticated,
+        warn_msg=WARN_MSG, check_sendas_dist=check_sendas_dist,
+        only_authenticated=only_authenticated,
         enforce_login=enforce_login)
     fd, cfg_path = tempfile.mkstemp(suffix='.ini')
     with os.fdopen(fd, 'w') as fh:
@@ -340,6 +369,97 @@ class PolicyTest(unittest.TestCase):
             mod, 'ALICE@EXAMPLE.TEST', '<ALICE@EXAMPLE.TEST>',
             'Alice\r\n\t <Alice@Example.Test>')
         self.assertEqual(mod.CONTINUE, r_env)
+        self.assertEqual(mod.CONTINUE, r_hdr)
+        self.assertIsNone(milter.reply)
+
+
+class DelegatedSendAsTest(unittest.TestCase):
+    """check_sendas_dist=true must accept account sendAs grants as well as
+    distribution-list sendAsDistList grants, and reject targets that have
+    neither. Delegated addresses live in ACL_DIRECTORY, keyed by the exact
+    (object class, right, address) tuple the LDAP filter must contain."""
+
+    def test_sendas_account_grant_accepted(self):
+        # alice has 'ID-ALICE usr sendAs' on the info@ account
+        mod = load_milter(check_sendas_dist='true')
+        milter, r_env, r_hdr = run_session(
+            mod, 'alice@example.test', '<alice@example.test>',
+            'Info <info@example.test>')
+        self.assertEqual(mod.CONTINUE, r_env)
+        self.assertEqual(mod.CONTINUE, r_hdr)
+        self.assertIsNone(milter.reply)
+
+    def test_sendas_account_grant_accepted_in_envelope(self):
+        # envelope sender is the delegated address; exclude_re on the own
+        # address so the envelope check runs against the login
+        mod = load_milter(check_sendas_dist='true',
+                          exclude_re='^alice@')
+        milter, r_env, r_hdr = run_session(
+            mod, 'alice@example.test', '<info@example.test>',
+            'Info <info@example.test>')
+        self.assertEqual(mod.CONTINUE, r_env)
+        self.assertEqual(mod.CONTINUE, r_hdr)
+        self.assertIsNone(milter.reply)
+
+    def test_sendas_account_without_grant_rejected(self):
+        # support@ has no ACL entry at all
+        mod = load_milter(check_sendas_dist='true')
+        milter, r_env, r_hdr = run_session(
+            mod, 'alice@example.test', '<alice@example.test>',
+            'Support <support@example.test>')
+        self.assertEqual(mod.REJECT, r_hdr)
+        self.assertEqual(('550', '5.7.1', WARN_MSG), milter.reply)
+
+    def test_sendas_grant_for_other_user_rejected(self):
+        # bob has no grant on info@ (only ID-ALICE does)
+        mod = load_milter(check_sendas_dist='true')
+        milter, r_env, r_hdr = run_session(
+            mod, 'bob@example.test', '<bob@example.test>',
+            'Info <info@example.test>')
+        self.assertEqual(mod.REJECT, r_hdr)
+        self.assertEqual(('550', '5.7.1', WARN_MSG), milter.reply)
+
+    def test_sendas_distlist_grant_accepted(self):
+        # alice has 'ID-ALICE usr sendAsDistList' on lists@
+        mod = load_milter(check_sendas_dist='true')
+        milter, r_env, r_hdr = run_session(
+            mod, 'alice@example.test', '<alice@example.test>',
+            'Lists <lists@example.test>')
+        self.assertEqual(mod.CONTINUE, r_env)
+        self.assertEqual(mod.CONTINUE, r_hdr)
+        self.assertIsNone(milter.reply)
+
+    def test_sendas_grant_wrong_objectclass_rejected(self):
+        # alice's account sendAs on info@ must not satisfy the DL filter;
+        # alice's DL sendAsDistList on lists@ must not satisfy the account
+        # filter. With check_sendas_dist off nothing is allowed either.
+        mod = load_milter(check_sendas_dist='false')
+        for addr, name in (('info@example.test', 'Info'),
+                           ('lists@example.test', 'Lists')):
+            milter, r_env, r_hdr = run_session(
+                mod, 'alice@example.test', '<alice@example.test>',
+                '{0} <{1}>'.format(name, addr))
+            self.assertEqual(mod.REJECT, r_hdr, addr)
+            self.assertEqual(('550', '5.7.1', WARN_MSG), milter.reply)
+
+    def test_ldap_error_during_acl_search_fails_open(self):
+        # own-address lookup succeeds... then fail: swap the connection for a
+        # failing one right before the ACL search. The failing conn must come
+        # from the same fake ldap module the milter imported, otherwise its
+        # LDAPError class doesn't match the one is_allowed catches.
+        mod = load_milter(check_sendas_dist='true')
+        ldap_mod = mod.ldap
+        milter = mod.CheckSenderAccess()
+        milter._symvals = {'{auth_authen}': 'alice@example.test'}
+        milter.reply = None
+        self.assertEqual(mod.CONTINUE, milter.envfrom('<alice@example.test>'))
+
+        class FailingConn:
+            def search_s(self, *args):
+                raise ldap_mod.LDAPError('search failed')
+
+        milter.ldp = FailingConn()
+        r_hdr = milter.header('From', 'Info <info@example.test>')
         self.assertEqual(mod.CONTINUE, r_hdr)
         self.assertIsNone(milter.reply)
 

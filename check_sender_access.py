@@ -5,7 +5,8 @@ check_sender_access.py - Python 3 port
 Milter that prevents users from setting a From: header that does not belong
 to them: the From: header address must match the envelope sender (MAIL FROM)
 or be one of that account's allowed addresses in LDAP (alias, canonical,
-catch-all, optionally send-as distribution list).
+catch-all, optionally a delegated account sendAs grant or a send-as
+distribution list).
 
 Original (Python 2): https://github.com/iomarmochtar/zmbr_check_sender
 
@@ -30,6 +31,9 @@ Changes from the original:
     Needed when Postfix itself does not verify that the envelope sender belongs
     to the logged-in user (original script trusted the envelope sender).
   * optional ZMBR_CONFIG environment variable to point to another config file
+  * `check_sendas_dist` additionally accepts a delegated account `sendAs`
+    grant on the target address, not only a distribution list
+    `sendAsDistList` grant
 """
 
 import os
@@ -253,17 +257,23 @@ class CheckSenderAccess(Milter.Base):
                 return True
 
             if zimbra_id and CHECK_SENDAS_DIST:
-                s_filter = (
-                    '(&(mail={0})(objectClass=zimbraDistributionList)'
-                    '(zimbraACE={1} usr sendAsDistList))'
-                ).format(escape(addr), escape(zimbra_id))
-                self.logd('Checking distribution list, running search filter {0}'.format(s_filter))
-                result = self.ldp.search_s(
-                    LDAP_CONF['base_search'], ldap.SCOPE_SUBTREE, s_filter, ['dn'])
-                if [e for e in result if e[0] is not None]:
-                    self.logd('{0} can send as distribution list {1}, allowing mail'.format(
-                        identity, addr))
-                    return True
+                for objclass, right, kind in (
+                        ('zimbraAccount', 'sendAs', 'account'),
+                        ('zimbraDistributionList', 'sendAsDistList',
+                         'distribution list')):
+                    s_filter = (
+                        '(&(mail={0})(objectClass={1})'
+                        '(zimbraACE={2} usr {3}))'
+                    ).format(escape(addr), objclass, escape(zimbra_id), right)
+                    self.logd('Checking {0}, running search filter {1}'.format(
+                        kind, s_filter))
+                    result = self.ldp.search_s(
+                        LDAP_CONF['base_search'], ldap.SCOPE_SUBTREE, s_filter,
+                        ['dn'])
+                    if [e for e in result if e[0] is not None]:
+                        self.logd('{0} can send as {1} {2}, allowing mail'.format(
+                            identity, kind, addr))
+                        return True
         except ldap.LDAPError as exc:
             self.log('LDAP error while checking {0}: {1}'.format(addr, exc))
             self.ldp = None

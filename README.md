@@ -12,7 +12,9 @@ It checks two things against LDAP:
 
 Only addresses in `domains` are checked. Aliases, catch-all and canonical
 addresses are accepted through the LDAP attributes listed in `search_attrs`;
-`check_sendas_dist` additionally allows `sendAsDistList` on distribution lists.
+`check_sendas_dist` additionally allows `sendAs` on a target account and
+`sendAsDistList` on a distribution list, so delegated senders of shared
+mailboxes (info@, support@, hr@) pass.
 Anything undecidable (LDAP down, bad bind, login not found in LDAP) is logged
 and the mail is let through, for authenticated and unauthenticated sessions
 alike: an LDAP outage never blocks mail. Only a proven violation is rejected.
@@ -34,7 +36,7 @@ path can be overridden with `ZMBR_CONFIG`.
 | `exclude_re`         | empty                                                       | Regex whitelist on the envelope sender: skips the envelope-vs-login check. The `From:` header is still checked against the SASL login for authenticated sessions. |
 | `exclude_enve_re`    | empty                                                       | Regex whitelist on the `From:` address.                                                                                                                           |
 | `warn_msg`           | `Client does not have permissions to send as this sender`   | Text of the `550 5.7.1` reply.                                                                                                                                    |
-| `check_sendas_dist`  | `false`                                                     | Also allow senders with `sendAsDistList` on a distribution list. Needs LDAP read rights for `zimbra_ldap_userdn`.                                                 |
+| `check_sendas_dist`  | `false`                                                     | Also allow senders granted `sendAs` on the target account or `sendAsDistList` on the target distribution list. Needs LDAP read rights for `zimbra_ldap_userdn`. |
 | `only_authenticated` | `false`                                                     | Check only SASL-authenticated sessions (ignore inbound port 25).                                                                                                  |
 | `enforce_login`      | `false`                                                     | Check the envelope sender against the SASL login as well as the `From:` header.                                                                                   |
 | `ldap.url`           | –                                                           | `ldap://host:389`. Use the host IP if LDAP does not listen on localhost.                                                                                          |
